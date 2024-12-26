@@ -20,7 +20,7 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
 
-## a not perfect translate from absl.flag to argparse, DB_DIR need to be writen in this script line 64
+## A not perfect translation from absl.flags to argparse; DB_DIR needs to be written in this script at line 64.
 
 from collections.abc import Callable, Iterable, Sequence
 import csv
