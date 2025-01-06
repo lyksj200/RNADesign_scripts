@@ -3,7 +3,10 @@ from openmm.app import *
 from openmm import *
 from openmm.unit import *
 from sys import stdout
-import os  # Import the os module to set environment variables
+import os
+import pickle
+import datetime  # Import datetime to generate unique filenames
+ns = 1000 * 1000 / 2  # Total number of steps (0.1 nanoseconds)
 
 # Create an argument parser object
 parser = argparse.ArgumentParser(description='Process PDB file path.')
@@ -13,6 +16,10 @@ parser.add_argument('pdb_path', type=str, help='Path to the PDB file')
 
 # Add an optional argument to specify the GPU device number (default is 0)
 parser.add_argument('--gpu', type=int, default=0, help='GPU device number to use (default: 0)')
+
+# Add an optional argument to specify whether to continue from a previous simulation
+parser.add_argument('--continue', dest='continue_sim', action='store_true', help='Continue from a previous simulation')
+parser.set_defaults(continue_sim=False)
 
 # Parse the command-line arguments
 args = parser.parse_args()
@@ -50,33 +57,51 @@ simulation = Simulation(modeller.topology, system, integrator)
 # Set the initial positions of the atoms in the simulation context
 simulation.context.setPositions(modeller.positions)
 
-# Save the initial system configuration to a GRO file
-print('save sys gro')
-positions = simulation.context.getState(getPositions=True).getPositions()
-PDBFile.writeFile(simulation.topology, positions, open('outsys.gro', 'w'))
+# If continuing from a previous simulation, load the state
+if args.continue_sim:
+    print("Continuing from previous simulation")
+    with open('simulation_state.pkl', 'rb') as f:
+        simulation.context.setState(pickle.load(f))
+    
+    # Generate a unique filename for the trajectory file in continue mode
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    trajectory_file = f'output_continue_{timestamp}.xtc'
+else:
+    # Save the initial system configuration to a GRO file
+    print('Saving initial system configuration')
+    positions = simulation.context.getState(getPositions=True).getPositions()
+    PDBFile.writeFile(simulation.topology, positions, open('outsys.gro', 'w'))
 
-# Minimize the energy of the system to remove bad contacts
-print("Minimizing energy")
-simulation.minimizeEnergy()
+    # Minimize the energy of the system to remove bad contacts
+    print("Minimizing energy")
+    simulation.minimizeEnergy()
+
+    # Use the default trajectory file name for the first run
+    trajectory_file = 'output.xtc'
 
 # Add reporters to the simulation to save trajectory and log data
-simulation.reporters.append(XTCReporter('output.xtc', 10000))  # Save trajectory in XTC format every 10,000 steps
+simulation.reporters.append(XTCReporter(trajectory_file, 10000))  # Save trajectory in XTC format every 10,000 steps
 simulation.reporters.append(StateDataReporter(stdout, 10000, step=True,
         potentialEnergy=True, temperature=True, volume=True))  # Print simulation data to the console every 10,000 steps
 simulation.reporters.append(StateDataReporter("md_log.txt", 1000, step=True,
         potentialEnergy=True, temperature=True, volume=True))  # Save simulation data to a log file every 1,000 steps
 
-# Run a short NVT simulation (constant volume, constant temperature)
-print("Running NVT")
-ns = 1000 * 1000 / 2  # Total number of steps (0.1 nanoseconds)
-simulation.step(0.1 * ns)  # Perform the simulation steps
+# Run a short NVT simulation (constant volume, constant temperature) if not continuing
+if not args.continue_sim:
+    print("Running NVT")
+    simulation.step(0.1 * ns)  # Perform the simulation steps
 
 # Add a barostat to the system for NPT simulation (constant pressure, constant temperature)
-print("Running md01")
+print("Running NPT")
 system.addForce(MonteCarloBarostat(1*bar, 300*kelvin))
 
 # Reinitialize the simulation context to apply the barostat
 simulation.context.reinitialize(preserveState=True)
 
 # Run a longer NPT simulation (300 nanoseconds)
-simulation.step(300 * ns)
+simulation.step(1000 * ns)
+
+# Save the final state of the simulation for future continuation
+print("Saving simulation state")
+with open('simulation_state.pkl', 'wb') as f:
+    pickle.dump(simulation.context.getState(getPositions=True, getVelocities=True), f)
