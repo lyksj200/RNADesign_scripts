@@ -9,6 +9,36 @@ from Bio import pairwise2
 from Bio.pairwise2 import format_alignment
 
 
+# It's a very simple letter correspondence table, but it works in most cases here.
+PROTEIN_DNA_COMMON_N_TO_ONE = {
+'ALA': 'A',
+'ARG': 'R',
+'ASN': 'N',
+'ASP': 'D',
+'CYS': 'C',
+'GLN': 'Q',
+'GLU': 'E',
+'GLY': 'G',
+'HIS': 'H',
+'ILE': 'I',
+'LEU': 'L',
+'LYS': 'K',
+'MET': 'M',
+'PHE': 'F',
+'PRO': 'P',
+'SER': 'S',
+'THR': 'T',
+'TRP': 'W',
+'TYR': 'Y',
+'VAL': 'V',
+'DA' : 'A',
+'DG' : 'G',
+'DC' : 'C',
+'DT' : 'T',
+'UNK': 'X'
+}
+
+
 def kabsch_rotation(P, Q):
     C = P.transpose(-1, -2) @ Q
     V, _, W = np.linalg.svd(C)
@@ -40,6 +70,8 @@ def get_pdb(filename):
             res_id = res.get_id()[1]
             d = {}
             d["resname"] = res.resname
+            if len(d["resname"]) > 1 and d["resname"] in PROTEIN_DNA_COMMON_N_TO_ONE:
+                d["resname"] = PROTEIN_DNA_COMMON_N_TO_ONE[d["resname"]]
             atoms = {}
             for a in res.get_atoms():
                 atoms[a.name] = a.get_coord()
@@ -48,6 +80,27 @@ def get_pdb(filename):
         chains.append(residues)
     return chains
 
+
+def get_cif(filename):
+    parser = MMCIFParser()
+    structure = parser.get_structure("tmp", filename)
+    chains = []
+    for model in structure:
+        for chain in model:
+            residues = {}
+            for res in chain:
+                res_id = res.get_id()[1]
+                d = {}
+                d["resname"] = res.get_resname()
+                if len(d["resname"]) > 1 and d["resname"] in PROTEIN_DNA_COMMON_N_TO_ONE:
+                    d["resname"] = PROTEIN_DNA_COMMON_N_TO_ONE[d["resname"]]
+                atoms = {}
+                for atom in res:
+                    atoms[atom.get_name()] = atom.get_coord()
+                d["atoms"] = atoms
+                residues[res_id] = d
+            chains.append(residues)
+    return chains
 
 def recursive_perm(intervals, cur_idx=0):
     if cur_idx >= len(intervals):
@@ -81,9 +134,9 @@ def get_coords(gt, pred):
             if "C4'" in gt[i][r]["atoms"] and "C4'" in pred[i][r]["atoms"]:
                 gt_coords.append(gt[i][r]["atoms"]["C4'"])
                 pred_coords.append(pred[i][r]["atoms"]["C4'"])
-            if "CA" in gt[i][r]["atoms"] and "CA" in pred[i][r]["atoms"]:
-                gt_coords.append(gt[i][r]["atoms"]["CA"])
-                pred_coords.append(pred[i][r]["atoms"]["CA"])
+            # if "CA" in gt[i][r]["atoms"] and "CA" in pred[i][r]["atoms"]:
+            #     gt_coords.append(gt[i][r]["atoms"]["CA"])
+            #     pred_coords.append(pred[i][r]["atoms"]["CA"])
     if gt_coords and pred_coords:
         gt_coords = np.stack(gt_coords)
         pred_coords = np.stack(pred_coords)
@@ -158,34 +211,21 @@ def compute_lddt(
     score = norm * (eps + np.sum(dists_to_score * score, axis=-1))
     return score.mean()
 
-
-def get_cif(filename):
-    parser = MMCIFParser()
-    structure = parser.get_structure("tmp", filename)
-    chains = []
-    for model in structure:
-        for chain in model:
-            residues = {}
-            for res in chain:
-                res_id = res.get_id()[1]
-                d = {}
-                d["resname"] = res.get_resname()
-                atoms = {}
-                for atom in res:
-                    atoms[atom.get_name()] = atom.get_coord()
-                d["atoms"] = atoms
-                residues[res_id] = d
-            chains.append(residues)
-    return chains
-
 from Bio import pairwise2
 from Bio.pairwise2 import format_alignment
+
+
+
+from Bio import pairwise2
+
 
 def align_residues(gt, pred):
     """
     Align residues between two structures (gt and pred) based on residue names.
     Returns filtered gt and pred with aligned residues.
     """
+    from Bio import pairwise2
+
     # Extract residue sequences (residue names) for both structures
     def get_residue_sequence(structure):
         sequence = []
@@ -197,12 +237,17 @@ def align_residues(gt, pred):
 
     gt_sequence = get_residue_sequence(gt)
     pred_sequence = get_residue_sequence(pred)
+    
     # Perform sequence alignment to find the longest common subsequence (LCS)
-    alignments = pairwise2.align.globalms(''.join(gt_sequence), ''.join(pred_sequence), 2, -1, -99, -99)
-    best_alignment = alignments[0]  # Take the best alignment
+    alignments = pairwise2.align.globalms(
+        ''.join(gt_sequence), 
+        ''.join(pred_sequence), 
+        2, -1, -99, -99  # Match score, mismatch penalty, open/extend gap penalties
+    )
+    best_alignment = alignments[0]
+
     aligned_gt_seq = best_alignment.seqA
     aligned_pred_seq = best_alignment.seqB
-
     # Find the indices of aligned residues
     gt_indices = []
     pred_indices = []
@@ -216,51 +261,27 @@ def align_residues(gt, pred):
             gt_idx += 1
         if pred_char != '-':
             pred_idx += 1
-    
 
+    # 确保索引数量一致
+    assert len(gt_indices) == len(pred_indices), "Alignment indices mismatch"
 
-    filtered_gt = {}
-    filtered_pred = {}
-    
-    # Counter for natural numbering
-    gt_counter = 0
-    pred_counter = 0
-    
-    # Process gt structure
-    for chain in gt:
-        for i, res_id in enumerate(sorted(chain.keys())):
-            if i in gt_indices:
-                # Use natural numbering for keys (0, 1, 2, ...)
-                filtered_gt[gt_counter] = chain[res_id]
-                gt_counter += 1
-    
-    # Process pred structure
-    for chain in pred:
-        for i, res_id in enumerate(sorted(chain.keys())):
-            if i in pred_indices:
-                # Use natural numbering for keys (0, 1, 2, ...)
-                filtered_pred[pred_counter] = chain[res_id]
-                pred_counter += 1
+    # 使用全局索引过滤残基
+    def filter_structure(structure, indices):
+        filtered = {}
+        counter = 0
+        global_idx = 0
+        for chain in structure:
+            for res_id in sorted(chain.keys()):
+                if global_idx in indices:
+                    filtered[counter] = chain[res_id]
+                    counter += 1
+                global_idx += 1
+        return filtered
+
+    filtered_gt = filter_structure(gt, gt_indices)
+    filtered_pred = filter_structure(pred, pred_indices)
 
     return filtered_gt, filtered_pred
-
-    # # Filter structures to keep only aligned residues
-    # filtered_gt = []
-    # filtered_pred = []
-    # for chain in gt:
-    #     filtered_chain = {}
-    #     for i, res_id in enumerate(sorted(chain.keys())):
-    #         if i in gt_indices:
-    #             filtered_chain[res_id] = chain[res_id]
-    #     filtered_gt.append(filtered_chain)
-    # for chain in pred:
-    #     filtered_chain = {}
-    #     for i, res_id in enumerate(sorted(chain.keys())):
-    #         if i in pred_indices:
-    #             filtered_chain[res_id] = chain[res_id]
-    #     filtered_pred.append(filtered_chain)
-
-    # return filtered_gt, filtered_pred
 
 def extract_c4_coords(filtered_gt, filtered_pred):
     """
@@ -278,7 +299,9 @@ def extract_c4_coords(filtered_gt, filtered_pred):
             if "C4'" in gt_res["atoms"] and "C4'" in pred_res["atoms"]:
                 gt_coords.append(gt_res["atoms"]["C4'"])
                 pred_coords.append(pred_res["atoms"]["C4'"])
-    
+            # if "CA" in gt_res["atoms"] and "CA" in pred_res["atoms"]:
+            #     gt_coords.append(gt_res["atoms"]["CA"])
+            #     pred_coords.append(pred_res["atoms"]["CA"])    
     # Convert to numpy arrays
     if gt_coords and pred_coords:
         gt_coords = np.array(gt_coords)
@@ -315,7 +338,7 @@ def compute_monomer(gt_pdb, pred_pdb):
         "gdt_ts": float(best_gdt_ts),
         "gdt_ha": float(best_gdt_ha),
     }
-    return metrics, filtered_gt, filtered_pred
+    return metrics, gt_coords, pred_coords
 
 
 def compute_multimer(gt_pdb, pred_pdb, entity, max_permutations=120):
