@@ -1,113 +1,351 @@
-"""
-This Python script is designed for processing and analyzing molecular dynamics (MD) trajectories of protein-nucleic acid complexes.
-It automates the workflow of trajectory preparation, essential analyses, and visualization, focusing on extracting insights
-into the dynamics and energetics of these biomolecular systems.
-
-The script performs the following main tasks:
-
-1. Trajectory Processing (using the `process_trajectory` function):
-   - Converts PDB structure to GRO format if a GRO file is not initially available.
-   - Reads molecular dynamics trajectory files in GRO and XTC formats.
-   - Selects atoms belonging to protein and nucleic acid components from the system.
-   - Applies a series of transformations to the trajectory to prepare it for analysis:
-     - Unwraps the complex to correct for periodic boundary conditions.
-     - Centers the nucleic acid within the simulation box based on its mass center.
-     - Wraps the complex back into the box, ensuring molecular integrity.
-     - Fits and rotates the protein based on a reference protein structure to remove overall translational and rotational motion,
-       facilitating the analysis of internal dynamics.
-   - Saves the processed trajectory as new GRO and XTC files, ready for subsequent analysis.
-
-2. Trajectory Analysis (using the `analyze_trajectory` function):
-   - Calculates key metrics to characterize the dynamics of the nucleic acid component:
-     - Root Mean Square Deviation (RMSD) of the nucleic acid over time, indicating conformational changes.
-     - Root Mean Square Fluctuation (RMSF) per residue of the nucleic acid, highlighting flexible regions.
-     - Energy landscape projections based on RMSD and Radius of Gyration (Rg) of the nucleic acid. These landscapes provide insights
-       into the free energy distribution and conformational preferences of the nucleic acid during the simulation.
-   - Generates and saves plots for RMSD over time, RMSF per residue, and the energy landscapes.
-   - Outputs the energy landscape data to text files for further quantitative analysis.
-   - Consolidates all generated plots into a single image file for easy review and saves a copy to a designated image output directory.
-
-3. Batch Processing via Main Function (`main` function):
-   - Sets user-defined parameters such as simulation temperature, output filename prefixes, and image output directory.
-   - Allows for flexible specification of molecular dynamics simulation directories to be processed, either through automatic directory
-     discovery based on naming conventions or by manually listing directory paths.
-   - Iterates through each specified simulation directory to:
-     - Determine if trajectory processing and/or analysis is needed based on the presence of processed files or simulation state files.
-     - Executes the `process_trajectory` and `analyze_trajectory` functions accordingly.
-   - Skips directories that do not contain relevant simulation files or are not valid directories, providing informative messages.
-   - Completes the analysis for all specified directories in a batch manner.
-
-This script is intended to streamline the analysis of molecular dynamics simulations, providing researchers with automated tools
-to assess the conformational dynamics and energetic landscapes of protein-nucleic acid complexes, which are crucial for understanding
-their biological functions and interactions.
-"""
 import os
 import MDAnalysis as mda
 from MDAnalysis.transformations import unwrap, center_in_box, wrap, fit_rot_trans
 from MDAnalysis.analysis.rms import RMSD, RMSF
-from MDAnalysis.analysis import align
+from MDAnalysis.analysis import align, pca  # 导入pca模块
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.constants  # Import physical constants library
-
-# --- User-modifiable parameters ---
-TEMPERATURE_K = 300  # Simulation temperature, Kelvin (K)
-OUTPUT_FILENAME_PREFIX = 'nucleic_analysis'  # Output filename prefix
-IMAGE_OUTPUT_DIR_NAME = 'outpng' # Image output directory name
-# --- End of parameter modifications ---
+import scipy.constants  # 导入物理常数库
+import argparse # 导入 argparse 模块
+from scipy.ndimage import gaussian_filter
+from matplotlib.colors import LinearSegmentedColormap
+from sklearn.decomposition import PCA  # 导入 sklearn PCA
 
 
-def process_trajectory(md_dir):
+# --- 用户需要修改的参数 ---
+TEMPERATURE_K = 300  # 模拟温度，单位开尔文 (K)
+OUTPUT_FILENAME_PREFIX = 'nucleic_analysis'  # 输出文件名的前缀
+FRAME_SAMPLING_INTERVAL = 1 # 轨迹抽帧间隔，每 FRAME_SAMPLING_INTERVAL 帧抽一帧
+IMAGE_OUTPUT_DIR_NAME = 'outpngeach'+str(FRAME_SAMPLING_INTERVAL) # 图片输出的文件夹名称
+TIME_PER_STEP_NS = 0.02  # 每步模拟的时长，单位纳秒 (ns)
+
+# --- 新增 FEL 分析相关参数 ---
+hist_bins_rmsd = 80
+hist_bins_rg = 40
+hist_bins_pca = 50
+gaussian_sigma = 1
+figure_size = (24, 6) # 保持原有的 figsize，因为要在一张图中显示四个子图
+run_pca_analysis = True # 默认进行 PCA 分析
+
+
+# --- 参数修改结束 ---
+
+# ---------------------------
+#  从参考代码复制的函数定义
+# ---------------------------
+
+def load_trajectory(gro_file, xtc_file):
+    """加载分子动力学轨迹."""
+    return mda.Universe(gro_file, xtc_file)
+
+def calculate_rmsd_rg(universe, selection, ref_universe=None):
+    """计算 RMSD 和回转半径 (Rg)."""
+    ref_atoms = ref_universe.select_atoms(selection) if ref_universe else universe.select_atoms(selection)
+    rmsd_analyzer = RMSD(universe.select_atoms(selection),
+                                     ref_atoms,
+                                     center=False,
+                                     superposition=False).run()
+    rmsd_values = rmsd_analyzer.results.rmsd[:, 2]
+
+    rgyr_values = []
+    for ts in universe.trajectory:
+        rgyr_values.append(universe.select_atoms(selection).radius_of_gyration())
+    rgyr_values = np.array(rgyr_values)
+    return rmsd_values, rgyr_values
+
+def calculate_pca_sklearn(universe, selection, n_components=2, already_aligned=False):
+    """使用 sklearn.decomposition.PCA 执行主成分分析 (PCA)."""
+    selected_atoms = universe.select_atoms(selection)
+    coords = []
+    for ts in universe.trajectory:
+        coords.append(selected_atoms.positions.flatten()) # 将每一帧的坐标展平
+    data_matrix = np.array(coords)
+
+    pca_sklearn = PCA(n_components=n_components) # 初始化 sklearn PCA
+    projections_sklearn = pca_sklearn.fit_transform(data_matrix) # 执行 PCA 拟合和降维
+    pc1_sklearn, pc2_sklearn = projections_sklearn[:, 0], projections_sklearn[:, 1] # 获取 PC1 和 PC2 投影
+
+    return pca_sklearn, pc1_sklearn, pc2_sklearn, pca_sklearn.explained_variance_ratio_ # 返回 sklearn PCA 对象, PC1, PC2, 方差解释比例
+
+
+def calculate_free_energy(x, y, bins_x=80, bins_y=40):
+    """计算二维自由能，并允许自定义 x 和 y 轴的 bins 数量，动态设置 bins 范围."""
+    # 动态计算 x 和 y 轴的 bins 范围
+    x_bins = np.linspace(0.9 * np.min(x), 1.1 * np.max(x), bins_x) # bins_x 个区间
+    y_bins = np.linspace(0.9 * np.min(y), 1.1 * np.max(y), bins_y) # bins_y 个区间
+
+    # 使用 numpy.histogram2d 计算二维直方图
+    hist, xedge, yedge = np.histogram2d(x, y, bins=[x_bins, y_bins], density=True)
+    hist += 1e-12  # 避免零值，防止计算 log 时出现错误
+    free_energy = -0.008314 * 300 * np.log(hist)  # 温度300K，单位 KBT
+    return free_energy - free_energy.max(), xedge, yedge
+
+
+def plot_fel(x_edges, y_edges, free_energy, fel_type, variance_explained=None, subplot_ax=None, add_padding=False):
     """
-    Process molecular dynamics trajectory, extract protein and nucleic acid, and perform fit and rotate.
+    绘制二维自由能景观图 (FEL 图).
 
-    Parameters:
-    md_dir (str): Path to the molecular dynamics simulation directory.
+    使用等高线和填充颜色来展示自由能 landscape，颜色从彩虹色到白色表示能量由低到高。
+
+    参数:
+    x_edges (numpy.ndarray):  X 轴边缘，由 calculate_free_energy 函数返回
+    y_edges (numpy.ndarray):  Y 轴边缘，由 calculate_free_energy 函数返回
+    free_energy (numpy.ndarray):  二维自由能矩阵，由 calculate_free_energy 函数返回
+    fel_type (str):  自由能图类型 ("PCA" 或 "RMSD-Rg")，用于设置标题和轴标签
+    variance_explained (list, 可选):  PCA 的方差解释比例，用于 PCA 图的轴标签，仅当 fel_type="PCA" 时使用，默认为 None
+    subplot_ax (matplotlib.axes._axes.Axes, 可选):  matplotlib 子图的 Axes 对象，如果提供，则在指定的子图中绘制，否则在当前 axes 中绘制，默认为 None
+    add_padding (bool, 可选): 是否在 FEL 图周围添加留白，默认为 False。 为 PCA 图添加留白通常可以改善视觉效果。
     """
-    print(f"Start processing trajectory files, directory: {md_dir}")
+    X, Y = np.meshgrid(x_edges[:-1], y_edges[:-1])
+    Z_smooth = gaussian_filter(free_energy.T, sigma=1)  # 对自由能矩阵进行高斯滤波平滑，sigma 值控制平滑程度
 
-    input_PDB = os.path.join(md_dir, "input.pdb")
-    input_gro = os.path.join(md_dir, "input.gro")
-    input_xtc = os.path.join(md_dir, "trajectory.xtc")
-    pro_nucle_gro = os.path.join(md_dir, "protein_nucleic.gro")
-    pro_nucle_xtc = os.path.join(md_dir, "protein_nucleic.xtc")
-    pro_nucle_gro_fit = os.path.join(md_dir, "protein_nucleic_fit.gro")
-    pro_nucle_xtc_fit = os.path.join(md_dir, "protein_nucleic_fit.xtc")
+    if add_padding: # 判断是否添加留白
+        # 设置留白的比例，在图的四周留出空白区域，使等高线和颜色填充不紧贴边缘
+        padding_factor = 0.2
+        x_padding = (np.max(x_edges) - np.min(x_edges)) * padding_factor
+        y_padding = (np.max(y_edges) - np.min(y_edges)) * padding_factor
 
-    # 1. PDB to GRO conversion (if gro file does not exist)
+        # 扩展 x 和 y 轴的范围，用于添加留白
+        extended_x_edges = np.linspace(np.min(x_edges) - x_padding, np.max(x_edges) + x_padding, len(x_edges) + int(len(x_edges) * padding_factor * 2))  # 根据 padding_factor 计算扩展的 bins 数量
+        extended_y_edges = np.linspace(np.min(y_edges) - y_padding, np.max(y_edges) + y_padding, len(y_edges) + int(len(y_edges) * padding_factor * 2))  # 根据 padding_factor 计算扩展的 bins 数量
+
+        # 创建新的自由能矩阵，并填充最大能量值，用于留白区域
+        extended_free_energy = np.full((len(extended_x_edges) - 1, len(extended_y_edges) - 1), np.max(free_energy))  # 填充最大能量
+
+        # 将原始自由能矩阵放置到新的矩阵的中心位置
+        x_center_start = (len(extended_x_edges) - 1 - len(x_edges)) // 2
+        y_center_start = (len(extended_y_edges) - 1 - len(y_edges)) // 2
+        extended_free_energy[x_center_start:x_center_start + len(free_energy),
+                                            y_center_start:y_center_start + len(free_energy[0])] = free_energy  # 将原始矩阵放在中心位置
+        X, Y = np.meshgrid(extended_x_edges[:-1], extended_y_edges[:-1]) # 重新生成网格坐标用于扩展后的区域
+        Z_smooth = gaussian_filter(extended_free_energy.T, sigma=1)  # 对扩展后的自由能矩阵进行高斯滤波平滑
+
+    # 定义彩虹到白色的颜色映射
+    colors = [(1, 0, 1), (0, 0, 1), (0, 1, 1), (0, 1, 0), (1, 1, 0), (1, 0.5, 0), (1, 0, 0), (1, 1, 1)] # 定义彩虹色到白色的颜色列表
+    white_to_rainbow = LinearSegmentedColormap.from_list('white_to_rainbow', colors, N=256) # 创建自定义颜色映射
+
+    levels = np.linspace(np.min(Z_smooth), 0, 8)  # 定义等高线 levels，从最小值到 0 分成 8 级
+    levels_fill = np.linspace(np.min(Z_smooth), np.max(Z_smooth), 80)  # 定义填充 levels，用于颜色填充的精细分级
+
+    ax = subplot_ax if subplot_ax else plt.gca()  # 决定在哪个 axes 上绘图，如果 subplot_ax 为 None，则使用当前 axes
+
+    # 绘制等高线和填充颜色
+    contour = ax.contour(X, Y, Z_smooth, levels=levels, alpha=1, colors="black", linewidths=0.5, linestyles='solid') # 绘制等高线
+    contourf = ax.contourf(X, Y, Z_smooth, levels=levels_fill, alpha=1, cmap=white_to_rainbow) # 绘制颜色填充
+    # ax.clabel(contour, inline=True, fontsize=8, colors='black', fmt='%.1f')  # 移除等高线标签
+    cbar = plt.colorbar(contourf, ax=ax, label=r"Free Energy (K$_{B}$T)")  # 添加颜色棒，显示自由能标尺，注意指定 ax
+    cbar.set_ticks([])
+
+    # 设置标题和轴标签
+    if fel_type == "PCA": # PCA 类型的 FEL 图
+        ax.set_xlabel(f"PC1 ({variance_explained[0]*100:.1f}%)", fontsize=10)  # X 轴标签，包含 PC1 和方差解释比例
+        ax.set_ylabel(f"PC2 ({variance_explained[1]*100:.1f}%)", fontsize=10)  # Y 轴标签，包含 PC2 和方差解释比例
+        ax.set_title("FEL: PC1 vs PC2", fontsize=10)  # 图标题
+    elif fel_type == "RMSD-Rg": # RMSD-Rg 类型的 FEL 图
+        ax.set_xlabel("RMSD (Å)", fontsize=10) # X 轴标签
+        ax.set_ylabel("Radius of Gyration (Å)", fontsize=10) # Y 轴标签
+        ax.set_title("FEL: RMSD vs Rg", fontsize=10) # 图标题
+    ax.tick_params(axis='both', labelsize=10)  # 设置坐标轴刻度字体大小
+
+
+# ---------------------------
+# 修改后的 analyze_trajectory 函数
+# ---------------------------
+
+
+def analyze_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit, output_dir, output_filename_prefix, image_output_dir):
+    """
+    分析分子动力学轨迹，计算 RMSD, RMSF 和能量 Landscape (PCA & RMSD-Rg)。
+
+    参数:
+    pro_nucle_gro_fit (str): fit 后的 GRO 文件路径。
+    pro_nucle_xtc_fit (str): fit 后的 XTC 文件路径。
+    output_dir (str): 输出文件保存的目录。
+    output_filename_prefix (str): 输出文件名的前缀。
+    image_output_dir (str): 图片输出的目录。
+    """
+    print(f"开始分析轨迹文件: GRO={pro_nucle_gro_fit}, XTC={pro_nucle_xtc_fit}")
+
+    # 加载轨迹和参考结构
+    try:
+        u = load_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit) # 使用新的 load_trajectory 函数
+        ref = load_trajectory(pro_nucle_gro_fit, pro_nucle_gro_fit)  # 使用初始结构作为参考，并使用 load_trajectory
+    except Exception as e:
+        print(f"加载轨迹文件失败: {e}")
+        return
+
+    nucleic_sel = "nucleic" # 核酸原子选择语句，与notebook保持一致
+    nucleic = u.select_atoms(nucleic_sel)
+    ref_nucleic = ref.select_atoms(nucleic_sel)
+
+    # 创建一个包含 1 行 4 列子图的 figure 和 axes 对象
+    fig, axes = plt.subplots(1, 4, figsize=figure_size, facecolor='white')  # 使用全局变量 figure_size，设置背景色为白色
+
+    # 1. 计算 RMSD 随时间的变化并绘图 (保持原有RMSD计算和绘图)
+    print("开始计算 RMSD...")
+    mobile_atoms_rmsd = u.select_atoms(nucleic_sel)
+    reference_atoms_rmsd = ref.select_atoms(nucleic_sel)
+
+    rmsd_analysis = RMSD(mobile_atoms_rmsd, reference_atoms_rmsd,
+                          center=True,
+                          superposition=True)
+    try:
+        rmsd_analysis.run()
+        rmsd_values = rmsd_analysis.rmsd[:, 2]
+        time_steps = range(len(rmsd_values))
+        time_ns = [step * TIME_PER_STEP_NS * FRAME_SAMPLING_INTERVAL for step in time_steps] # 将 time_steps 转换为 time_ns
+
+        axes[0].plot(time_ns, rmsd_values)  # 使用 time_ns 作为横轴数据
+        axes[0].set_xlabel('Time (ns)')      # 更新 x 轴标签为 'Time (ns)'
+        axes[0].set_ylabel('RMSD (Å)')
+        axes[0].set_title('RMSD of Nucleic Over Time')
+        print(f"RMSD 随时间变化图已准备")
+    except Exception as e:
+        print(f"RMSD 计算失败: {e}")
+
+
+    # 2. 计算 RMSF 并绘图 (保持原有RMSF计算和绘图)
+    print("开始计算 RMSF...")
+    try:
+        aligner_rmsf = align.AlignTraj(u, ref, select='protein', in_memory=True).run()  # 对齐用于RMSF计算
+        rmsf_analyzer = RMSF(nucleic).run()
+
+        residues = nucleic.residues.resids
+        res_rmsf = []
+        for res in nucleic.residues:
+            atom_indices = res.atoms.ix - nucleic[0].ix
+            res_rmsf.append(rmsf_analyzer.results.rmsf[atom_indices].mean())
+
+        axes[1].plot(residues, res_rmsf, 'o-')  # 使用 axes[1] 绘制
+        axes[1].set_xlabel('Residue ID')
+        axes[1].set_ylabel('RMSF (Å)')
+        axes[1].set_title('RMSF per Residue (Nucleic)')
+        print(f"RMSF per Residue 图已准备")
+    except Exception as e:
+        print(f"RMSF 计算失败: {e}")
+
+
+    # ---------------------------
+    #  替换原有能量 Landscape 部分 (使用新的函数)
+    # ---------------------------
+    # 3. 基于PCA的FEL (PC1 vs PC2)  (替换原有基于RMSD的能量 Landscape)
+    if run_pca_analysis:
+        print("\nPerforming PCA analysis and FEL calculation (sklearn)...")
+        try:
+            pca_sklearn_obj, pc1_sklearn, pc2_sklearn, variance_ratio_sklearn = calculate_pca_sklearn(u, nucleic_sel, n_components=2, already_aligned=False)
+            free_energy_pca, xedge_pca, yedge_pca = calculate_free_energy(pc1_sklearn, pc2_sklearn, bins_x=hist_bins_pca, bins_y=hist_bins_pca) # PCA 使用 hist_bins_pca
+            plot_fel(xedge_pca, yedge_pca, free_energy_pca, "PCA", variance_explained=variance_ratio_sklearn[:2], subplot_ax=axes[2], add_padding=True) # 使用 axes[2] 绘制, 并传递子图 axes，添加留白
+            print(f"PCA based FEL 图已准备")
+
+            # 保存 PCA FEL 数据 (可选)
+            output_data_filename_pca_el = os.path.join(output_dir, f"{output_filename_prefix}_pca_energy_landscape_data.txt")
+            # 将X_pca, Y_pca, free_energy_pca.T  flatten 后保存为三列数据
+            X_pca, Y_pca = np.meshgrid(xedge_pca[:-1], yedge_pca[:-1]) # 确保 X_pca, Y_pca 已定义
+            np.savetxt(output_data_filename_pca_el, np.column_stack([X_pca.flatten(), Y_pca.flatten(), free_energy_pca.T.flatten()]),
+                        header='PC1  PC2  Free Energy (K$_{B}$T)', fmt='%10.5f')
+            print(f"基于 PCA 的能量 landscape 数据已保存到文件: {output_data_filename_pca_el}")
+
+
+        except Exception as e:
+            print(f"PCA 分析和 FEL 计算失败: {e}")
+    else:
+        print("跳过 PCA 分析.")
+
+
+    # 4. 基于RMSD和Rg的FEL  (替换原有基于Rg的能量 Landscape)
+    print("\nCalculating RMSD and Rg based FEL...")
+    try:
+        rmsd_values_rg, rgyr_values = calculate_rmsd_rg(u, nucleic_sel, ref_universe=ref) # 使用新的 calculate_rmsd_rg 函数
+        free_energy_rg, xedge_rg, yedge_rg = calculate_free_energy(rmsd_values_rg, rgyr_values, bins_x=hist_bins_rmsd, bins_y=hist_bins_rg) # RMSD-Rg 使用 hist_bins_rmsd 和 hist_bins_rg
+        plot_fel(xedge_rg, yedge_rg, free_energy_rg, "RMSD-Rg", subplot_ax=axes[3], add_padding=False) # 使用 axes[3] 绘制, 并传递子图 axes，不加留白
+        print(f"RMSD vs Rg based FEL 图已准备")
+
+        # 保存 RMSD-Rg FEL 数据 (可选)
+        output_data_filename_rg_el = os.path.join(output_dir, f"{output_filename_prefix}_rmsd_rg_energy_landscape_data.txt")
+        # 将X_rg, Y_rg, free_energy_rg.T flatten 后保存为三列数据
+        X_rg, Y_rg = np.meshgrid(xedge_rg[:-1], yedge_rg[:-1]) # 确保 X_rg, Y_rg 已定义
+        np.savetxt(output_data_filename_rg_el, np.column_stack([X_rg.flatten(), Y_rg.flatten(), free_energy_rg.T.flatten()]),
+                    header='RMSD (Å)  Rg (Å)  Free Energy (K$_{B}$T)', fmt='%10.5f')
+        print(f"基于 RMSD-Rg 的能量 landscape 数据已保存到文件: {output_data_filename_rg_el}")
+
+
+    except Exception as e:
+        print(f"RMSD 和 Rg based FEL 计算失败: {e}")
+
+    plt.tight_layout()  # 自动调整子图布局，避免重叠
+    output_plot_filename_all = os.path.join(output_dir, f"{output_filename_prefix}_all_plots.png")
+    fig.savefig(output_plot_filename_all)  # 保存包含所有子图的 figure
+    print(f"所有分析图形已保存为: {output_plot_filename_all}")
+
+
+    # 将生成的 all_plots 图片复制到指定的图片输出文件夹 (保持原有图片复制逻辑)
+    try:
+        md_dirname = os.path.basename(output_dir) # 获取 md_dir 的目录名
+        image_output_path_all_plots = os.path.join(image_output_dir, f"{md_dirname}_all_plots.png") # 使用 md_dirname 作为新的文件名
+        fig.savefig(image_output_path_all_plots) # 保存 all plots 图
+        print(f"分析图片已复制到图片输出文件夹: {image_output_dir}")
+    except Exception as e:
+        print(f"复制分析图片到输出文件夹失败: {e}")
+
+
+    # plt.show()  #  统一显示所有图形 # 注释掉，不需要显示图形
+
+    print(f"轨迹分析完成。结果文件已保存到: {output_dir}, 图片已保存到: {image_output_dir}")
+
+
+
+def process_trajectory(md_dir, frame_sampling_interval):
+    """
+    处理分子动力学轨迹，提取蛋白质和核酸，并进行fit和rotate。抽帧间隔可变。
+
+    参数:
+    md_dir (str): 分子动力学模拟目录的路径。
+    frame_sampling_interval (int): 轨迹抽帧间隔，每 frame_sampling_interval 帧抽一帧。
+    """
+    print(f"开始处理轨迹文件，目录: {md_dir}, 抽帧间隔: {frame_sampling_interval}")
+
+    input_PDB = os.path.join(md_dir, "outsys.pdb")
+    input_gro = os.path.join(md_dir, "outsys_new.gro")
+    input_xtc = os.path.join(md_dir, "output.xtc")
+    pro_nucle_gro = os.path.join(md_dir, f"PD_sample{frame_sampling_interval}.gro") # 文件名包含抽帧信息
+    pro_nucle_xtc = os.path.join(md_dir, f"PD_sample{frame_sampling_interval}.xtc") # 文件名包含抽帧信息
+    pro_nucle_gro_fit = os.path.join(md_dir, f"PD_fit_sample{frame_sampling_interval}.gro") # 文件名包含抽帧信息
+    pro_nucle_xtc_fit = os.path.join(md_dir, f"PD_fit_sample{frame_sampling_interval}.xtc") # 文件名包含抽帧信息
+
+    # 1. PDB to GRO 转换 (如果 gro 文件不存在)
     if not os.path.exists(input_gro):
-        print(f"Converting PDB file to GRO file: {input_PDB} -> {input_gro}")
+        print(f"将PDB文件转换为GRO文件: {input_PDB} -> {input_gro}")
         try:
             u_pdb = mda.Universe(input_PDB, format="pdb")
             u_pdb.atoms.write(input_gro)
         except Exception as e:
-            print(f"PDB to GRO conversion failed: {e}")
+            print(f"PDB to GRO 转换失败: {e}")
             return
 
-    # 2. Read gro and xtc files
+    # 2. 读取 gro 和 xtc 文件
     try:
         u = mda.Universe(input_gro, input_xtc)
     except Exception as e:
-        print(f"Failed to read GRO and XTC files: {e}")
+        print(f"读取GRO和XTC文件失败: {e}")
         return
 
-    # 3. Select protein and nucleic acid and write new gro and xtc (no frame skipping)
+    # 3. 选择蛋白质和核酸并写入新的 gro 和 xtc (按指定间隔抽帧)
     protein_and_nucleic = u.select_atoms('protein or nucleic')
-    protein_and_nucleic.dimensions = u.dimensions # Keep box dimension information
+    protein_and_nucleic.dimensions = u.dimensions # 保留盒子尺寸信息
     try:
-        protein_and_nucleic.write(pro_nucle_gro) # Save as new gro
-        with mda.Writer(pro_nucle_xtc, protein_and_nucleic.atoms.n_atoms) as W: # Save as new xtc (skipping frames every 100 frames)
-            for ts in u.trajectory[::100]: # Here is still frame skipping, according to your notebook code, keep frame skipping
+        protein_and_nucleic.write(pro_nucle_gro) # 保存为新的 gro
+        with mda.Writer(pro_nucle_xtc, protein_and_nucleic.atoms.n_atoms) as W: # 保存为新的 xtc (按指定间隔抽帧)
+            for ts in u.trajectory[::frame_sampling_interval]: # 使用可变抽帧间隔
                 W.write(protein_and_nucleic.atoms)
-        print(f"Saved GRO and XTC files for protein and nucleic acid: {pro_nucle_gro}, {pro_nucle_xtc}")
+        print(f"已保存蛋白质和核酸的 gro 和 xtc 文件: {pro_nucle_gro}, {pro_nucle_xtc}")
     except Exception as e:
-        print(f"Failed to save GRO/XTC files for protein and nucleic acid: {e}")
+        print(f"保存蛋白质和核酸的 gro/xtc 文件失败: {e}")
         return
 
 
-    # 4. Fit and Rotate trajectory processing
+    # 4. Fit and Rotate 轨迹处理
     try:
-        u_fit = mda.Universe(pro_nucle_gro, pro_nucle_xtc) # Use new gro and xtc
+        u_fit = mda.Universe(pro_nucle_gro, pro_nucle_xtc) # 使用新的 gro 和 xtc
         protein = u_fit.select_atoms('protein')
         dna = u_fit.select_atoms('nucleic')
         complex_fit = u_fit.select_atoms('protein or nucleic')
@@ -123,183 +361,40 @@ def process_trajectory(md_dir):
         )
         u_fit.trajectory.add_transformations(*workflow)
 
-        u_fit.atoms.write(pro_nucle_gro_fit) # Save fit gro
-        with mda.Writer(pro_nucle_xtc_fit, u_fit.atoms.n_atoms) as W: # Save fit xtc (all frames)
+        u_fit.atoms.write(pro_nucle_gro_fit) # 保存 fit 后的 gro
+        with mda.Writer(pro_nucle_xtc_fit, u_fit.atoms.n_atoms) as W: # 保存 fit 后的 xtc (所有帧)
             for ts in u_fit.trajectory:
                 W.write(u_fit.atoms)
-        print(f"Saved fit & rotated GRO and XTC files: {pro_nucle_gro_fit}, {pro_nucle_xtc_fit}")
+        print(f"已保存 fit & rotated 的 gro 和 xtc 文件: {pro_nucle_gro_fit}, {pro_nucle_xtc_fit}")
 
     except Exception as e:
-        print(f"Trajectory Fit & Rotate processing failed: {e}")
+        print(f"轨迹 Fit & Rotate 处理失败: {e}")
         return
 
-    print(f"Trajectory file processing completed, directory: {md_dir}")
-
-
-
-def analyze_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit, output_dir, output_filename_prefix, image_output_dir):
-    """
-    Analyze molecular dynamics trajectory, calculate RMSD, RMSF and Energy Landscape.
-
-    Parameters:
-    pro_nucle_gro_fit (str): Path to the fitted GRO file.
-    pro_nucle_xtc_fit (str): Path to the fitted XTC file.
-    output_dir (str): Directory to save output files.
-    output_filename_prefix (str): Output filename prefix.
-    image_output_dir (str): Image output directory.
-    """
-    print(f"Start analyzing trajectory files: GRO={pro_nucle_gro_fit}, XTC={pro_nucle_xtc_fit}")
-
-    # Load trajectory and reference structure
-    try:
-        u = mda.Universe(pro_nucle_gro_fit, pro_nucle_xtc_fit)
-        ref = mda.Universe(pro_nucle_gro_fit)  # Use initial structure as reference
-    except Exception as e:
-        print(f"Failed to load trajectory files: {e}")
-        return
-
-    nucleic = u.select_atoms('nucleic')
-    ref_nucleic = ref.select_atoms('nucleic')
-
-    # Create a figure and axes object with 1 row and 4 columns of subplots
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))  # Adjust figsize to make image wider
-
-    # 1. Calculate RMSD over time and plot
-    print("Start calculating RMSD...")
-    mobile_atoms_rmsd = u.select_atoms('nucleic')
-    reference_atoms_rmsd = ref.select_atoms('nucleic')
-
-    rmsd_analysis = RMSD(mobile_atoms_rmsd, reference_atoms_rmsd,
-                          center=True,
-                          superposition=True)
-    try:
-        rmsd_analysis.run()
-        rmsd_values = rmsd_analysis.rmsd[:, 2]
-        time_steps = range(len(rmsd_values))
-
-        axes[0].plot(time_steps, rmsd_values)  # Use axes[0] to plot
-        axes[0].set_xlabel('Time Step')
-        axes[0].set_ylabel('RMSD (Å)')
-        axes[0].set_title('RMSD of Nucleic Over Time')
-        print(f"RMSD over time plot is ready")
-    except Exception as e:
-        print(f"RMSD calculation failed: {e}")
-
-
-    # 2. Calculate RMSF and plot
-    print("Start calculating RMSF...")
-    try:
-        aligner_rmsf = align.AlignTraj(u, ref, select='nucleic', in_memory=True).run()  # Align for RMSF calculation
-        rmsf_analyzer = RMSF(nucleic).run()
-
-        residues = nucleic.residues.resids
-        res_rmsf = []
-        for res in nucleic.residues:
-            atom_indices = res.atoms.ix - nucleic[0].ix
-            res_rmsf.append(rmsf_analyzer.results.rmsf[atom_indices].mean())
-
-        axes[1].plot(residues, res_rmsf, 'o-')  # Use axes[1] to plot
-        axes[1].set_xlabel('Residue ID')
-        axes[1].set_ylabel('RMSF (Å)')
-        axes[1].set_title('RMSF per Residue (Nucleic)')
-        print(f"RMSF per Residue plot is ready")
-    except Exception as e:
-        print(f"RMSF calculation failed: {e}")
-
-
-    # 3. Calculate RMSD-based Energy Landscape and plot
-    print("Start calculating RMSD-based Energy Landscape...")
-    try:
-        rmsd_analyzer_el = RMSD(u, ref, select='nucleic', in_memory=True)  # Recalculate RMSD, or use the previously calculated rmsd_analyzer
-        rmsd_analyzer_el.run()
-        rmsd_values_el = rmsd_analyzer_el.rmsd[:, 2]
-
-        kB = scipy.constants.Boltzmann
-        kT = kB * TEMPERATURE_K
-
-        hist_rmsd_el, bin_edges_rmsd_el = np.histogram(rmsd_values_el, bins=50, density=True)
-        bin_centers_rmsd_el = (bin_edges_rmsd_el[:-1] + bin_edges_rmsd_el[1:]) / 2
-
-        free_energy_rmsd_el = -kT * np.log(hist_rmsd_el)
-        free_energy_kJ_mol_rmsd_el = free_energy_rmsd_el / 1000 / 4.184
-        min_free_energy_rmsd_el = np.min(free_energy_kJ_mol_rmsd_el[np.isfinite(free_energy_kJ_mol_rmsd_el)])
-        free_energy_land_rmsd_el = free_energy_kJ_mol_rmsd_el - min_free_energy_rmsd_el
-
-        axes[2].plot(bin_centers_rmsd_el, free_energy_land_rmsd_el, '-')  # Use axes[2] to plot
-        axes[2].set_xlabel('RMSD (Å)')
-        axes[2].set_ylabel('Free Energy (kJ/mol)')
-        axes[2].set_title('Energy Landscape (RMSD)')
-
-        output_data_filename_rmsd_el = os.path.join(output_dir, f"{output_filename_prefix}_rmsd_energy_landscape_data.txt")
-        np.savetxt(output_data_filename_rmsd_el, np.column_stack([bin_centers_rmsd_el, free_energy_land_rmsd_el]),
-                    header='RMSD (Å)  Free Energy (kJ/mol)', fmt='%10.5f')
-        print(f"RMSD-based energy landscape data saved to file: {output_data_filename_rmsd_el}")
-        print(f"RMSD-based energy landscape plot is ready")
-
-    except Exception as e:
-        print(f"RMSD-based Energy Landscape calculation failed: {e}")
-
-
-    # 4. Calculate Rg-based Energy Landscape and plot
-    print("Start calculating Rg-based Energy Landscape...")
-    try:
-        rg_values = []
-        for ts in u.trajectory:
-            rg = nucleic.radius_of_gyration()
-            rg_values.append(rg)
-        rg_values = np.array(rg_values)
-
-        hist_rg_el, bin_edges_rg_el = np.histogram(rg_values, bins=50, density=True)
-        bin_centers_rg_el = (bin_edges_rg_el[:-1] + bin_edges_rg_el[1:]) / 2
-        free_energy_rg_el = -kT * np.log(hist_rg_el)
-        free_energy_kJ_mol_rg_el = free_energy_rg_el / 1000 / 4.184
-        min_free_energy_rg_el = np.min(free_energy_kJ_mol_rg_el[np.isfinite(free_energy_kJ_mol_rg_el)])
-        free_energy_land_rg_el = free_energy_kJ_mol_rg_el - min_free_energy_rg_el
-
-        axes[3].plot(bin_centers_rg_el, free_energy_land_rg_el, '-')  # Use axes[3] to plot
-        axes[3].set_xlabel('Radius of Gyration (Rg, Å)')
-        axes[3].set_ylabel('Free Energy (kJ/mol)')
-        axes[3].set_title('Energy Landscape (Rg)')
-
-        output_data_filename_rg_el = os.path.join(output_dir, f"{output_filename_prefix}_rg_energy_landscape_data.txt")
-        np.savetxt(output_data_filename_rg_el, np.column_stack([bin_centers_rg_el, free_energy_land_rg_el]),
-                    header='Rg (Å)  Free Energy (kJ/mol)', fmt='%10.5f')
-        print(f"Rg-based energy landscape data saved to file: {output_data_filename_rg_el}")
-        print(f"Rg-based energy landscape plot is ready")
-
-    except Exception as e:
-        print(f"Rg-based Energy Landscape calculation failed: {e}")
-
-
-    plt.tight_layout()  # Automatically adjust subplot layout to prevent overlap
-    output_plot_filename_all = os.path.join(output_dir, f"{output_filename_prefix}_all_plots.png")
-    fig.savefig(output_plot_filename_all)  # Save figure containing all subplots
-    print(f"All analysis plots saved as: {output_plot_filename_all}")
-
-
-    # Copy the generated all_plots image to the specified image output folder
-    try:
-        md_dirname = os.path.basename(output_dir) # Get md_dir directory name
-        image_output_path_all_plots = os.path.join(image_output_dir, f"{md_dirname}_all_plots.png") # Use md_dirname as new filename
-        fig.savefig(image_output_path_all_plots) # Save all plots image
-        print(f"Analysis images copied to image output folder: {image_output_dir}")
-    except Exception as e:
-        print(f"Failed to copy analysis images to output folder: {e}")
-
-
-    # plt.show()  #  Display all plots together # Comment out, no need to display plots
-
-    print(f"Trajectory analysis completed. Result files saved to: {output_dir}, images saved to: {image_output_dir}")
+    print(f"轨迹文件处理完成，目录: {md_dir}, 抽帧间隔: {frame_sampling_interval}")
 
 
 
 def main():
-    # --- List of md_dir to be processed ---
-    # Here you need to modify the md_dir list according to your actual situation.
-    # It can be a manually specified list, or automatically obtain all subdirectories that meet the conditions under a certain directory.
-    image_output_dir = os.path.join("path/to/image/output/parent/directory", IMAGE_OUTPUT_DIR_NAME)# Image output folder name
-    md_parent_dir = "path/to/parent/directory/containing/md_directories" # Please replace with the parent directory containing all md_dir
-    # md_dirs = [os.path.join(md_parent_dir, d) for d in os.listdir(md_parent_dir) if os.path.isdir(os.path.join(md_parent_dir, d)) and d.startswith('iter2_')] # Automatically find directories starting with 'hdockoutpdb_relax_from_index'
+    # 创建 ArgumentParser 对象
+    parser = argparse.ArgumentParser(description="分子动力学轨迹分析脚本，可指定父目录和图片输出基础目录。")
+
+    # 添加命令行参数
+    parser.add_argument('--md_parent_dir', type=str, required=True,
+                        help='分子动力学模拟目录的父目录路径')
+    parser.add_argument('--image_output_base_dir', type=str, required=True,
+                        help='图片输出文件夹的基础目录路径')
+
+    # 解析命令行参数
+    args = parser.parse_args()
+
+    # 从命令行参数获取 md_parent_dir 和 image_output_base_dir
+    md_parent_dir = args.md_parent_dir
+    image_output_base_dir = args.image_output_base_dir
+    image_output_dir = os.path.join(image_output_base_dir, IMAGE_OUTPUT_DIR_NAME) # 图片输出文件夹名称，基于传入的基础目录
+
+    # --- 需要处理的 md_dir 列表 ---
+    # ... (目录列表获取部分，保持不变) ...
     md_dirs = []
     parent_dir_contents = os.listdir(md_parent_dir)
 
@@ -308,43 +403,35 @@ def main():
         if os.path.isdir(item_path):
             if item_name.startswith('iter2_'):
                 md_dirs.append(item_path)
-
-
-    # If you want to manually specify the md_dir list, you can use the following way, and comment out the above automatic search way
-    # md_dirs = [
-    #     "/path/to/md_dir1",
-    #     "/path/to/md_dir2",
-    #     # ... more md_dir paths
-    # ]
-    # --- End of md_dir list configuration ---
+    # --- md_dir 列表配置结束 ---
 
 
     if not os.path.exists(image_output_dir):
-        os.makedirs(image_output_dir)  # If image output folder does not exist, create it
+        os.makedirs(image_output_dir)  # 如果图片输出文件夹不存在，则创建
 
     for md_dir in md_dirs:
-        if not os.path.isdir(md_dir): # Ensure it is directory
-            print(f"Skipping non-directory path: {md_dir}")
+        if not os.path.isdir(md_dir): # 确保是目录
+            print(f"跳过非目录路径: {md_dir}")
             continue
 
-        print(f"Start processing directory: {md_dir}")
-        simulation_state_pkl = os.path.join(md_dir, "simulation_state.pkl") # Check if simulation_state.pkl exists
-        pro_nucle_gro_fit = os.path.join(md_dir, "protein_nucleic_fit.gro") # Check if PD_fit.gro exists
-        pro_nucle_xtc_fit = os.path.join(md_dir, "protein_nucleic_fit.xtc") # Check if PD_fit.xtc exists
-        output_dir = md_dir # Output file path is md_dir itself
+        print(f"开始处理目录: {md_dir}")
+        simulation_state_pkl = os.path.join(md_dir, "simulation_state.pkl") # 检查 simulation_state.pkl 是否存在
+        pro_nucle_gro_fit = os.path.join(md_dir, f"PD_fit_sample{FRAME_SAMPLING_INTERVAL}.gro") # 检查对应抽帧间隔的 fit 后 gro 文件是否存在
+        pro_nucle_xtc_fit = os.path.join(md_dir, f"PD_fit_sample{FRAME_SAMPLING_INTERVAL}.xtc") # 检查对应抽帧间隔的 fit 后 xtc 文件是否存在
+        output_dir = md_dir # 输出文件路径为 md_dir 自身
 
-        if os.path.exists(pro_nucle_gro_fit) and os.path.exists(pro_nucle_xtc_fit): # If fit gro and xtc files already exist, directly perform analysis
-            print(f"Found existing fitted files: {pro_nucle_gro_fit}, {pro_nucle_xtc_fit}. Skipping trajectory processing, proceeding directly to analysis.")
+        if os.path.exists(pro_nucle_gro_fit) and os.path.exists(pro_nucle_xtc_fit): # 如果 fit 后的 gro 和 xtc 文件已存在，则直接执行分析 (检查对应抽帧间隔的文件)
+            print(f"发现已存在的 fit 后文件 (抽帧间隔为 {FRAME_SAMPLING_INTERVAL}): {pro_nucle_gro_fit}, {pro_nucle_xtc_fit}。跳过轨迹处理，直接进行分析。")
             analyze_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit, output_dir, OUTPUT_FILENAME_PREFIX, image_output_dir)
-        elif os.path.exists(simulation_state_pkl): # If simulation_state.pkl exists, but fit files do not exist, then perform trajectory processing and analysis
-            print(f"Found simulation_state.pkl file: {simulation_state_pkl}. Performing trajectory processing and analysis.")
-            process_trajectory(md_dir) # Perform trajectory processing
-            analyze_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit, output_dir, OUTPUT_FILENAME_PREFIX, image_output_dir) # Perform analysis
-        else: # If simulation_state.pkl and fit files do not exist, then skip this directory
-            print(f"Did not find simulation_state.pkl or processed files in directory {md_dir}, skipping this directory.")
-        print(f"Directory {md_dir} processing completed.\n")
+        elif os.path.exists(simulation_state_pkl): # 如果 simulation_state.pkl 存在，但 fit 后文件不存在，则执行轨迹处理和分析
+            print(f"发现 simulation_state.pkl 文件: {simulation_state_pkl}。执行轨迹处理和分析，抽帧间隔为 {FRAME_SAMPLING_INTERVAL}。")
+            process_trajectory(md_dir, FRAME_SAMPLING_INTERVAL) # 执行轨迹处理，传入抽帧间隔参数
+            analyze_trajectory(pro_nucle_gro_fit, pro_nucle_xtc_fit, output_dir, OUTPUT_FILENAME_PREFIX, image_output_dir) # 执行分析
+        else: # 如果 simulation_state.pkl 和 fit 后文件都不存在，则跳过该目录
+            print(f"在目录 {md_dir} 中未发现 simulation_state.pkl 或已处理的文件，跳过该目录。")
+        print(f"目录 {md_dir} 处理完成。\n")
 
-    print("All directories processing completed.")
+    print("所有目录处理完成。")
 
 
 if __name__ == "__main__":
